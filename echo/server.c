@@ -49,7 +49,7 @@ inline void verbose_out(const char * tag)
     time_t now;
     now = time(NULL); 
     strftime(buf, 64, "%F %T", localtime(&now)); 
-    fprintf(stderr, "[%d] %s [%s] ", (int)getpid(), buf, tag);
+    fprintf(stderr, "[%d] %s *%s* ", (int)getpid(), buf, tag);
 }
 
 /* error msg */
@@ -115,6 +115,14 @@ struct epoll_state_st {
     int nhandlers;
 };
 
+struct conn_st {
+    int     fd;
+    void *  server;
+
+    struct conn_st * prev;
+    struct conn_st * next;
+};
+
 struct server_st {
     int fd;
 
@@ -122,11 +130,20 @@ struct server_st {
     struct addrinfo * addr_next;
 
     struct epoll_state_st * ep_state;
+
+    struct sockaddr_in  sa_local;
+
+    struct conn_st * conn_list;
 };
 
 /* prototypes */
 static void server_freeaddr(struct server_st * serv);
 static void server_close(struct server_st * serv);
+static int server_accept_handler_add(struct server_st * serv);
+static int accept_conn(int fd, int event, void * arg);
+
+static int conn_handler(struct conn_st * conn);
+
 
 /*
  * 
@@ -203,9 +220,10 @@ static int epoll_add(struct epoll_state_st * ep, struct handler_st * handler)
 
     op = handler->inpoll? EPOLL_CTL_MOD: EPOLL_CTL_ADD;
     if (epoll_ctl(ep->epfd, op, handler->fd, &epev) == -1) {
-        error("epoll_ctl error!");
+        error("epoll_ctl error: %s\n", strerror(errno));
         return -1;
     }
+    handler->inpoll = true;
     return 0;
 }
 
@@ -252,6 +270,23 @@ static void server_close(struct server_st * serv)
     serv->fd = -1;
 
     server_freeaddr(serv);
+}
+
+static int server_accept_handler_add(struct server_st * serv)
+{
+    debug("add accept handler to epoll\n");
+    struct handler_st * handler;
+
+    if (!serv) return -1;
+
+    handler = &(serv->ep_state->handlers[serv->fd]);
+    handler_set(handler, serv->fd, EPOLLIN, accept_conn, (void*)serv);
+
+    if (epoll_add(serv->ep_state, handler) != 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 /*
@@ -371,11 +406,65 @@ int server_setup(struct server_st * serv, uint16_t port)
 
 
 /* accept new connection */
-int accept_conn(int fd, int event, void * arg)
+static int accept_conn(int fd, int event, void * arg)
 {
-    debug("new connection %d\n", fd);
-    close(fd);
-    return -1;
+    struct server_st * serv = arg;
+    int client_fd;
+    struct conn_st * conn;
+    socklen_t len;
+
+    if (server_accept_handler_add(serv) != 0)
+    {
+        error("accept event add  error: %s\n", strerror(errno));
+        return -1;
+    }
+
+    while (1) {
+        len = sizeof(serv->sa_local);
+        client_fd = accept(fd, (struct sockaddr*)&serv->sa_local, &len);
+        if (client_fd == -1) {
+            if (errno == EINTR) {
+                continue;
+            } else {
+                error("accetp error:%s\n", strerror(errno));
+                return -1;
+            }
+        }
+        break;
+    }
+
+    /* handler the client sock */
+    debug("client_fd:%d peer %s:%d\n", client_fd, inet_ntoa(serv->sa_local.sin_addr), ntohs(serv->sa_local.sin_port));
+    conn = calloc(1, sizeof(struct conn_st));
+    if (conn == NULL) {
+        error("oom for conn_st\n");
+        close(client_fd);
+        return -1;
+    }
+
+    conn->fd = client_fd;
+    conn->server = serv;
+
+    if (serv->conn_list) {
+        serv->conn_list->prev = conn;
+    }
+    conn->prev = NULL;
+    conn->next = serv->conn_list;
+    serv->conn_list = conn;
+
+    return conn_handler(conn);
+}
+
+
+static int conn_handler(struct conn_st * conn)
+{
+    if (!conn) {
+        return -1;
+    }
+    
+    //close(conn->fd);
+
+    return 0;
 }
 
 void server_destroy(struct server_st * serv)
@@ -498,14 +587,11 @@ int main(int argc, char * argv[])
     }
 
     debug("add listen sock to epoll\n");
-    handler = &(server.ep_state->handlers[server.fd]);
-    handler_set(handler, server.fd, EPOLLIN, accept_conn, (void*)&server);
-
-    if (epoll_add(server.ep_state, handler) != 0) {
+    if (server_accept_handler_add(&server) != 0) {
         server_destroy(&server);
         exit(1);
     }
-
+    
     /* the main loop */
     main_loop(&server);
 
