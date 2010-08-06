@@ -21,8 +21,8 @@
 /*
  * macros
  */
-#define SEND_SIZE 8192
-#define RECV_SIZE 8192
+#define ECHO_SEND_SIZE 8192
+#define ECHO_RECV_SIZE 8192
 #define SEND_TIMEOUT 10
 #define RECV_TIMEOUT 10
 
@@ -32,6 +32,10 @@
 #define EPOLL_EVENT_HINTS   128
 #define EPOLL_EVENT_INIT    128
 #define EPOLL_EVENT_MAX     32000
+
+#define ECHO_REQUEST_MAX_SIZE    10240
+#define ECHO_SEND_BUF_SIZE 1024
+#define ECHO_RECV_BUF_SIZE 1024
 
 #define VERBOSE_ERROR 1
 #define VERBOSE_WARN  2
@@ -119,8 +123,31 @@ struct conn_st {
     int     fd;
     void *  server;
 
+    enum {
+        ECHO_CONN_IDLE,
+        ECHO_CONN_RECV,
+        ECHO_CONN_SEND
+    } state;
+
+    enum {
+        ECHO_RECV_NONE,
+        ECHO_RECV_DATA
+    } recv_state;
+
+    char *  recv_buf_ptr;
+    size_t  recv_buf_size;
+    size_t  recv_buf_offset;
+
+    char *  send_buf_ptr;
+    size_t  send_buf_size;
+    size_t  send_buf_offset;
+    size_t  send_data_len;
+
     struct conn_st * prev;
     struct conn_st * next;
+
+    char    recv_buf[ECHO_RECV_BUF_SIZE];
+    char    send_buf[ECHO_SEND_BUF_SIZE];
 };
 
 struct server_st {
@@ -133,7 +160,9 @@ struct server_st {
 
     struct sockaddr_in  sa_local;
 
+    /* about conns */
     struct conn_st * conn_list;
+    size_t  conn_count;
 };
 
 /* prototypes */
@@ -142,8 +171,14 @@ static void server_close(struct server_st * serv);
 static int server_accept_handler_add(struct server_st * serv);
 static int accept_conn(int fd, int event, void * arg);
 
-static int conn_handler(struct conn_st * conn);
+static struct handler_st * get_handler(struct server_st * serv, int fd);
 
+static struct conn_st * conn_new(struct server_st * serv, int fd);
+static int conn_request(int fd, int event, void * arg);
+static int conn_response(int fd, int event, void * arg);
+static void conn_close(struct conn_st * conn);
+static int conn_buffer_extend(char ** buf, size_t size, bool use_realloc);
+        
 
 /*
  * 
@@ -227,9 +262,29 @@ static int epoll_add(struct epoll_state_st * ep, struct handler_st * handler)
     return 0;
 }
 
-static int epoll_del()
+static int epoll_del(struct epoll_state_st * ep, struct handler_st * handler)
 {
+    struct epoll_event epev = {0, {0}};
 
+    if (!ep || !ep->events || !ep->handlers || !handler) {
+         return -1; 
+    }
+    assert(handler->fd != -1);
+
+    epev.events = handler->mask;
+    epev.data.ptr = handler;
+
+    if (epoll_ctl(ep->epfd, EPOLL_CTL_DEL, handler->fd, &epev) == -1) {
+        error("%s error: %s\n", __func__, strerror(errno));
+        return -1;
+    }
+
+    handler->inpoll = false;
+    handler->fd = -1;
+    handler->mask = 0;
+    handler->fn = NULL;
+    handler->arg = NULL;
+    return 0;
 }
 
 static void epoll_destroy(struct epoll_state_st * ep)
@@ -272,6 +327,20 @@ static void server_close(struct server_st * serv)
     server_freeaddr(serv);
 }
 
+static struct handler_st * get_handler(struct server_st * serv, int fd)
+{
+    struct handler_st * handler;
+
+    if (!serv || !serv->ep_state || !serv->ep_state->handlers) 
+        return NULL;
+
+    if (fd == -1)
+        return NULL;
+
+    handler = &(serv->ep_state->handlers[fd]);
+    return handler;
+}
+
 static int server_accept_handler_add(struct server_st * serv)
 {
     debug("add accept handler to epoll\n");
@@ -279,7 +348,9 @@ static int server_accept_handler_add(struct server_st * serv)
 
     if (!serv) return -1;
 
-    handler = &(serv->ep_state->handlers[serv->fd]);
+    handler = get_handler(serv, serv->fd);
+    assert(handler);
+
     handler_set(handler, serv->fd, EPOLLIN, accept_conn, (void*)serv);
 
     if (epoll_add(serv->ep_state, handler) != 0) {
@@ -322,9 +393,10 @@ int server_init(struct server_st * serv)
 int server_setup(struct server_st * serv, uint16_t port)
 {
     int fd, ret;
-    struct addrinfo hints;
     char host_str[NI_MAXHOST];
     char port_str[NI_MAXSERV];
+    struct addrinfo hints;
+    struct sockaddr_in * sin;
 
     if (!serv) return -1;
 
@@ -380,16 +452,15 @@ int server_setup(struct server_st * serv, uint16_t port)
     }
 
     /* bind */
-    if (getnameinfo(serv->addr_next->ai_addr, serv->addr_next->ai_addrlen,
-        host_str, NI_MAXHOST,
-        port_str, NI_MAXSERV,
-        0) != 0) {
-        error("getname info error:%s\n", strerror(errno));
+    sin = (struct sockaddr_in *)serv->addr_next->ai_addr;
+    if (!inet_ntop(serv->addr_next->ai_family, &sin->sin_addr,
+            host_str, NI_MAXHOST)) {
+        error("inet_ntop error: %s\n", strerror(errno));
         server_close(serv);
         return -1;
     }
 
-    debug("bind on %s:%s\n", host_str, port_str);
+    debug("bind on %s:%d\n", host_str, port);
     if (bind(serv->fd, serv->addr_next->ai_addr, serv->addr_next->ai_addrlen) == -1) {
         error("bind error :%s\n", strerror(errno));
         server_close(serv);
@@ -413,12 +484,6 @@ static int accept_conn(int fd, int event, void * arg)
     struct conn_st * conn;
     socklen_t len;
 
-    if (server_accept_handler_add(serv) != 0)
-    {
-        error("accept event add  error: %s\n", strerror(errno));
-        return -1;
-    }
-
     while (1) {
         len = sizeof(serv->sa_local);
         client_fd = accept(fd, (struct sockaddr*)&serv->sa_local, &len);
@@ -434,16 +499,41 @@ static int accept_conn(int fd, int event, void * arg)
     }
 
     /* handler the client sock */
-    debug("client_fd:%d peer %s:%d\n", client_fd, inet_ntoa(serv->sa_local.sin_addr), ntohs(serv->sa_local.sin_port));
+    debug("client_fd: %d peer %s:%d\n", client_fd, 
+            inet_ntoa(serv->sa_local.sin_addr), ntohs(serv->sa_local.sin_port));
+
+    conn = conn_new(serv, client_fd);
+    if (!conn) {
+        error("conn_new error!\n");
+        return 0;
+    }
+
+    return 0;
+}
+
+static struct conn_st * conn_new(struct server_st * serv, int fd)
+{
+    debug("%s fd :%d\n", __func__, fd);
+    struct conn_st * conn;
+    struct handler_st * handler;
+
     conn = calloc(1, sizeof(struct conn_st));
     if (conn == NULL) {
         error("oom for conn_st\n");
-        close(client_fd);
-        return -1;
+        close(fd);
+        return NULL;
     }
 
-    conn->fd = client_fd;
+    conn->fd = fd;
     conn->server = serv;
+    conn->state = ECHO_CONN_IDLE;
+    conn->recv_state = ECHO_RECV_NONE;
+
+    conn->send_buf_ptr = conn->send_buf;
+    conn->send_buf_size = ECHO_SEND_BUF_SIZE;
+
+    conn->recv_buf_ptr = conn->recv_buf;
+    conn->recv_buf_size = ECHO_RECV_BUF_SIZE;
 
     if (serv->conn_list) {
         serv->conn_list->prev = conn;
@@ -451,21 +541,216 @@ static int accept_conn(int fd, int event, void * arg)
     conn->prev = NULL;
     conn->next = serv->conn_list;
     serv->conn_list = conn;
+    serv->conn_count++;
 
-    return conn_handler(conn);
+    /* add event */
+    handler = get_handler(serv, fd);
+    assert(handler);
+    debug("%s add the client fd to epoll\n", __func__);
+    handler_set(handler, fd, EPOLLIN | EPOLLET, conn_request, (void*)conn);
+    if (epoll_add(serv->ep_state, handler) != 0) {
+        error("epoll_add error:%s\n", strerror(errno));
+        free(conn);
+        return NULL;
+    }
+
+    return conn;
 }
 
-
-static int conn_handler(struct conn_st * conn)
+static int conn_request(int fd, int event, void * arg)
 {
-    if (!conn) {
-        return -1;
+    int nread;
+    char * buf;
+    size_t buf_size;
+    struct conn_st * conn = arg;
+
+    debug("%s :%d\n", __func__, fd);
+    assert(event & EPOLLIN);
+    assert(arg);
+
+    conn->recv_state = ECHO_RECV_DATA;
+
+    buf = conn->recv_buf_ptr + conn->recv_buf_offset;
+    buf_size = conn->recv_buf_size - conn->recv_buf_offset;
+
+    debug("%s fd:%d buf:%p buf_size:%d\n", __func__, fd, buf, buf_size);
+    while (1) {
+        nread = read(fd, buf, buf_size);
+        if (nread == 0) {
+            error("the client close the connections!\n");
+            conn_close(conn);
+            return -1;
+        } else if (nread == -1) {
+            if (errno == EINTR) 
+                continue;
+
+            error("the connection error:%s\n", strerror(errno));
+            conn_close(conn);
+            return -1;
+        } else {
+            conn->recv_buf_offset += nread;
+            if (conn->recv_buf_offset > ECHO_REQUEST_MAX_SIZE) {
+                error("the reqeust is too big!\n");
+                conn_close(conn);
+                return -1;
+            }
+
+            if (conn->recv_buf_offset == conn->recv_buf_size) {
+                size_t new_size = conn->recv_buf_size * 2;
+                debug("the recv buffer is full, need to extend\n");
+                if (conn_buffer_extend(&conn->recv_buf_ptr, new_size,
+                        conn->recv_buf_ptr == conn->recv_buf? false: true) != 0) {
+                    conn_close(conn);
+                    return -1;
+                }
+                conn->recv_buf_size = new_size;
+                return 0;
+            }
+            break;
+        }
     }
-    
-    //close(conn->fd);
+
+    /* handler the request */
+    debug("find the \\n in the request\n");
+    if (memrchr(conn->recv_buf_ptr, '\n', nread)) {
+        struct handler_st * handler;
+        struct server_st * server = conn->server;
+
+        if (conn->recv_buf_offset > conn->send_buf_size) {
+            /* need extend */
+            bool realloc = conn->send_buf_ptr == conn->send_buf? false: true;
+            if (conn_buffer_extend(&conn->send_buf_ptr, conn->recv_buf_size, realloc) != 0) {
+                conn_close(conn);
+                return -1;
+            }
+            conn->send_buf_size = conn->recv_buf_size;
+        }
+
+        /* copy the recvived data to send buffer */
+        memcpy(conn->send_buf_ptr, conn->recv_buf_ptr, conn->recv_buf_offset);
+        conn->send_data_len = conn->recv_buf_offset;
+
+        conn->recv_buf_offset = 0;
+        conn->recv_state = ECHO_RECV_NONE;
+
+        /* add event */
+        handler = get_handler(server, fd);
+        assert(handler);
+        handler_set(handler, fd, EPOLLOUT, conn_response, (void*)conn);
+        if (epoll_add(server->ep_state, handler) != 0) {
+            error("epoll_add error:%s\n", strerror(errno));
+            conn_close(conn);
+            return -1;
+        }
+    }
 
     return 0;
 }
+
+static int conn_response(int fd, int event, void * arg)
+{
+    char * buf;
+    size_t nwrite, remain;
+    struct conn_st * conn = arg;
+    
+    buf = conn->send_buf_ptr + conn->send_buf_offset;
+    remain = conn->send_data_len - conn->send_buf_offset;
+    debug("%s buf:%p remain:%d\n", __func__, buf, remain);
+    
+    while (1) {
+        nwrite = write(fd, buf, remain);
+        if (nwrite == -1) {
+            if (errno == EINTR)
+                continue;
+
+            error("write to %d error: %s\n", fd, strerror(errno));
+            conn_close(conn);
+            return -1;
+        } else {
+            conn->send_buf_offset += nwrite;
+            break;
+        }
+    }
+
+    if (conn->send_buf_offset == conn->send_data_len) {
+        struct handler_st * handler;
+        struct server_st * serv = conn->server;
+        debug("all the data send out!\n");
+        conn->send_buf_offset = 0;
+        conn->send_data_len = 0;
+        conn->state = ECHO_CONN_IDLE;
+
+        /* change event */
+        handler = get_handler(serv, fd);
+        assert(handler);
+        debug("%s change the client fd event to EPOLLIN\n", __func__);
+        handler_set(handler, fd, EPOLLIN, conn_request, (void*)conn);
+        if (epoll_add(serv->ep_state, handler) != 0) {
+            error("epoll_add error:%s\n", strerror(errno));
+            free(conn);
+            return -1;
+        }
+
+    }
+
+    return 0;
+}
+
+static void conn_close(struct conn_st * conn)
+{
+    struct server_st * serv;
+    struct handler_st * handler;
+    if (!conn) return;
+
+    serv = conn->server;
+    if (conn->fd != -1) {
+        handler = get_handler(serv, conn->fd);
+        if (handler) {
+            epoll_del(serv->ep_state, handler);
+        }
+
+        close(conn->fd);
+        conn->fd = -1;
+    }
+
+    if (conn->send_buf_ptr != conn->send_buf) {
+        free(conn->send_buf_ptr);
+        conn->send_buf_ptr = NULL;
+    }
+
+    if (conn->recv_buf_ptr != conn->recv_buf) {
+        free(conn->recv_buf_ptr);
+        conn->recv_buf_ptr = NULL;
+    }
+
+    if (conn->prev)
+        conn->prev->next = conn->next;
+    if (conn->next)
+        conn->next->prev = conn->prev;
+
+    if (serv->conn_list == conn)
+        serv->conn_list = conn->next;
+}
+
+static int conn_buffer_extend(char ** buf, size_t size, bool use_realloc)
+{
+    char * p = *buf;
+    if (realloc) {
+        p = realloc(p, size);
+    } else {
+        p = malloc(size);
+    }
+
+
+    if (p == NULL) {
+        error("oom");
+        return -1;
+    }
+    *buf = p;
+    return 0;
+}
+
+
 
 void server_destroy(struct server_st * serv)
 {
@@ -506,7 +791,7 @@ int _setsockopt(struct server_st * serv)
     }
 
     /* set the send buf */
-    ret = SEND_SIZE;
+    ret = ECHO_SEND_SIZE;
     ret = setsockopt(serv->fd, SOL_SOCKET, SO_SNDBUF,
             &ret, (socklen_t)sizeof(int));
     if (ret == -1) {
@@ -515,7 +800,7 @@ int _setsockopt(struct server_st * serv)
     }
 
     /* set the recv buf */
-    ret = RECV_SIZE;
+    ret = ECHO_RECV_SIZE;
     ret = setsockopt(serv->fd, SOL_SOCKET, SO_RCVBUF,
             &ret, (socklen_t)sizeof(int));
     if (ret == -1) {
@@ -631,9 +916,6 @@ int main_loop(struct server_st * server)
                 handler->fn(handler->fd, events, handler->arg);
             }
         }
-
-        sleep(1);
     }
-
     return 0;
 }
