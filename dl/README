@@ -1,0 +1,51 @@
+a dynamically loaded library example.
+test the visibility of global variable in shared libraries.
+
+---------------
+http://unix.derkeiler.com/Newsgroups/comp.unix.programmer/2003-05/0342.html
+
+atre_nikhil@yahoo.co.in (Nikhil Atre) writes:
+
+> * If a global variable is defined in a shared library, can the
+> *same instance* of the variable be accessed in a program that links
+> with the shared library ?
+
+Yes (by default), on all UNICes.
+
+However, you *can* change the default behaviour and build a shared
+library such that a global defined it will not be visible outside. On
+Linux, try 'info ld' and read the "Scripts" section.
+
+[It is probably because of this, that you can't get a definitive
+answer -- it depends on how things are built]
+
+> * And what about vice versa ? i.e. if the global variable is in
+> the executable program that links with the library, then will
+> references to that variable in the shared library refer to the
+> instance in the executable, or to a separate copy?
+
+Yes, on *most* UNICes.
+
+On Linux, to achieve that, you must use -Wl,--export-dynamic
+when linking main executable.
+
+On AIX, you must use 'deferred imports' and enable 'runtime linking'.
+
+> * Will the answers to the above be different depending on whether
+> the variable is initialized or uninitialized at the point of
+> definition ?
+
+No.
+
+> And on whether the library is linked in on the gcc/ld
+> command line itself or subsequently loaded dynamically using
+> 'dlopen()'
+
+No.
+
+> Finally, is there a canonical reference book/website where the
+> *practical* details of variable visiblity/scope/extent for libraries
+> are clearly explained ? I've seen the GCC and ELF HOWTOs but they're
+> not all that useful so I'd greatly appreciate any help.
+
+I don't know of any. 
